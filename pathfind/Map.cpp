@@ -559,6 +559,17 @@ bool Map::FindPath(const math::Vertex& start, const math::Vertex& end,
     return true;
 }
 
+const Tile* Map::GetTile(float x, float y) const
+{
+    // find the tile corresponding to this (x, y)
+    int tileX, tileY;
+    math::Convert::WorldToTile({x, y, 0.f}, tileX, tileY);
+
+    auto const tile = m_tiles.find({tileX, tileY});
+
+    return tile == m_tiles.end() ? nullptr : tile->second.get();
+}
+
 bool Map::GetADTHeight(const Tile* tile, float x, float y, float& height,
                        unsigned int* zone, unsigned int* area) const
 {
@@ -635,51 +646,70 @@ bool Map::GetADTHeight(const Tile* tile, float x, float y, float& height,
     return false;
 }
 
-float Map::FindPreciseZ(float x, float y, float zHint) const
+bool Map::FindPreciseZ(const Tile* tile, float x, float y, float zHint,
+                       bool includeAdt, float& result) const
 {
-    float result = zHint;
+    result = zHint;
+
+    // check BVH data for this tile
+    bool rayHit;
 
     // zHint is assumed to be a value from the Detour detailed tri mesh, which
     // has an error of +/- MeshSettings::DetailSampleMaxError. because we want
     // to ensure that zHint is above the 'true' value, we shift up this error
-    // range so that the error is instead 0 <= error <=
-    // 2*MeshSettings::DetailSampleMaxError
-    zHint += MeshSettings::DetailSampleMaxError;
+    // range for the ray so that the error is instead:
+    // 0 <= error <= 2*MeshSettings::DetailSampleMaxError
 
-    // find the tile corresponding to this (x, y)
-    int tileX, tileY;
-    math::Convert::WorldToTile({x, y, 0.f}, tileX, tileY);
-
-    auto const tile = m_tiles.find({tileX, tileY});
-
-    if (tile == m_tiles.end())
-        THROW(Result::TILE_NOT_FOUND_FOR_REQUESTED);
-
-    // check BVH data for this tile
-    // note that we assume the ground, if there is any, is within 2x
-    bool rayHit;
-    math::Ray ray {{x, y, zHint},
+    math::Ray ray {{x, y, zHint + MeshSettings::DetailSampleMaxError},
                    {x, y, zHint - 3.f * MeshSettings::DetailSampleMaxError}};
-    if ((rayHit = RayCast(ray, {tile->second.get()})))
+    if ((rayHit = RayCast(ray, {tile}, true)))
         result = ray.GetHitPoint().Z;
 
+    // if we don't care about adts, we're done
+    if (!includeAdt)
+        return rayHit;
+
     float adtHeight;
-    auto const adtHit = GetADTHeight(tile->second.get(), x, y, adtHeight);
+    auto const adtHit = GetADTHeight(tile, x, y, adtHeight);
 
     // one of these two should always hit, at least in places where this query
     // is expected to be made
     assert(rayHit || adtHit);
 
-    // if no object was hit but the adt was, we don't care about the current
-    // value of 'result'
-    if (adtHit && (!rayHit || (adtHeight > result)))
-        result = adtHeight;
+    // if no adt was hit, success depends only on whether the ray hit
+    if (!adtHit)
+        return rayHit;
+    // if the ray did not hit, success depends only on whether the adt has
+    // height here
+    else if (!rayHit)
+        return adtHit;
 
-    return result;
+    // if both hit, there are a number of possibilities:
+    // * there is a cave, with adt terrain up above
+    // * we are in a building high above adt terrain
+    // * there is an object with adt right above
+    // * there is an object right above the adt
+    // im pretty sure the most general solution to accommodate all
+    // possibilities is to check if the two values are within the detail max
+    // error.  if so, use the higher of the two.  and if not, use whichever is
+    // closer to the original hint.
+
+    if (fabs(result - adtHeight) < MeshSettings::DetailSampleMaxError)
+        return (std::max)(result, adtHeight);
+
+    auto const rayError = fabs(result - zHint);
+    auto const adtError = fabs(adtHeight - zHint);
+
+    return rayError < adtError ? result : adtHeight;
 }
 
 bool Map::FindHeights(float x, float y, std::vector<float>& output) const
 {
+    auto const tile = GetTile(x, y);
+
+    if (!tile)
+        return false;
+
     constexpr float extents[] = {0.f, (std::numeric_limits<float>::max)(), 0.f};
     float recastCenter[3];
 
@@ -699,12 +729,21 @@ bool Map::FindHeights(float x, float y, std::vector<float>& output) const
     // always precise, never, or user-defined?
     for (auto i = 0; i < polyCount; ++i)
     {
-        float result;
+        float zHint;
 
-        if (m_navQuery.getPolyHeight(polys[i], recastCenter, &result) ==
+        if (m_navQuery.getPolyHeight(polys[i], recastCenter, &zHint) ==
             DT_SUCCESS)
-            output.push_back(FindPreciseZ(x, y, result));
+        {
+            float result;
+
+            if (FindPreciseZ(tile, x, y, zHint, false, result))
+                output.push_back(result);
+        }
     }
+
+    float adtHeight;
+    if (GetADTHeight(tile, x, y, adtHeight))
+        output.push_back(adtHeight);
 
     return !output.empty();
 }
@@ -752,7 +791,14 @@ bool Map::ZoneAndArea(const math::Vertex& position, unsigned int& zone,
     return rayResult || adtResult;
 }
 
-bool Map::RayCast(math::Ray& ray) const
+bool Map::LineOfSight(const math::Vertex& start, const math::Vertex& stop) const
+{
+    math::Ray ray {start, stop};
+    // RayCast() returns true when an obstacle is hit
+    return !RayCast(ray, false);
+}
+
+bool Map::RayCast(math::Ray& ray, bool doodads) const
 {
     std::vector<const Tile*> tiles;
 
@@ -761,11 +807,11 @@ bool Map::RayCast(math::Ray& ray) const
         if (ray.IntersectBoundingBox(tile.second->m_bounds))
             tiles.push_back(tile.second.get());
 
-    return RayCast(ray, tiles);
+    return RayCast(ray, tiles, doodads);
 }
 
 bool Map::RayCast(math::Ray& ray, const std::vector<const Tile*>& tiles,
-                  unsigned int* zone, unsigned int* area) const
+                  bool doodads, unsigned int* zone, unsigned int* area) const
 {
     auto const start = ray.GetStartPoint();
     auto const end = ray.GetEndPoint();
@@ -829,108 +875,126 @@ bool Map::RayCast(math::Ray& ray, const std::vector<const Tile*>& tiles,
         }
 
         // measure intersection for all static doodads on this tile
-        for (auto const& id : tile->m_staticDoodads)
+        if (doodads)
         {
-            // skip static doodads we have already seen (possibly from a
-            // previous tile)
-            if (staticDoodads.find(id) != staticDoodads.end())
-                continue;
-
-            // record this static doodad as having been tested
-            staticDoodads.insert(id);
-
-            auto const& instance = m_staticDoodads.at(id);
-
-            // skip this doodad if the bbox doesn't intersect, saves us from
-            // calculating the inverse ray
-            if (!ray.IntersectBoundingBox(instance.m_bounds))
-                continue;
-
-            math::Ray rayInverse(math::Vector3::Transform(
-                                     start, instance.m_inverseTransformMatrix),
-                                 math::Vector3::Transform(
-                                     end, instance.m_inverseTransformMatrix));
-
-            // if this is a closer hit, update the original ray's distance
-            if (instance.m_model.lock()->m_aabbTree.IntersectRay(rayInverse) &&
-                rayInverse.GetDistance() < ray.GetDistance())
+            for (auto const& id : tile->m_staticDoodads)
             {
-                hit = true;
-                ray.SetHitPoint(rayInverse.GetDistance());
-            }
-        }
+                // skip static doodads we have already seen (possibly from a
+                // previous tile)
+                if (staticDoodads.find(id) != staticDoodads.end())
+                    continue;
 
-        // measure intersection for all temporary wmos on this tile
-        for (auto const& wmo : tile->m_temporaryWmos)
-        {
-            // skip static wmos we have already seen (possibly from a previous
-            // tile)
-            if (temporaryWmos.find(wmo.first) != temporaryWmos.end())
-                continue;
+                // record this static doodad as having been tested
+                staticDoodads.insert(id);
 
-            // record this temporary wmo as having been tested
-            temporaryWmos.insert(wmo.first);
+                auto const& instance = m_staticDoodads.at(id);
 
-            // skip this wmo if the bbox doesn't intersect, saves us from
-            // calculating the inverse ray
-            if (!ray.IntersectBoundingBox(wmo.second->m_bounds))
-                continue;
+                // skip this doodad if the bbox doesn't intersect, saves us from
+                // calculating the inverse ray
+                if (!ray.IntersectBoundingBox(instance.m_bounds))
+                    continue;
 
-            math::Ray rayInverse(
-                math::Vector3::Transform(start,
-                                         wmo.second->m_inverseTransformMatrix),
-                math::Vector3::Transform(end,
-                                         wmo.second->m_inverseTransformMatrix));
+                math::Ray rayInverse(
+                    math::Vector3::Transform(start,
+                                             instance.m_inverseTransformMatrix),
+                    math::Vector3::Transform(
+                        end, instance.m_inverseTransformMatrix));
 
-            // if this is a closer hit, update the original ray's distance
-            if (auto model = wmo.second->m_model.lock())
-            {
-                if (model->m_aabbTree.IntersectRay(rayInverse) &&
+                // if this is a closer hit, update the original ray's distance
+                if (instance.m_model.lock()->m_aabbTree.IntersectRay(
+                        rayInverse) &&
                     rayInverse.GetDistance() < ray.GetDistance())
                 {
                     hit = true;
                     ray.SetHitPoint(rayInverse.GetDistance());
-                    if (area)
-                        *area =
-                            model->m_nameSetToAreaZone[wmo.second->m_nameSet]
-                                .first;
-                    if (zone)
-                        *zone =
-                            model->m_nameSetToAreaZone[wmo.second->m_nameSet]
-                                .second;
+                }
+            }
+        }
+
+        // measure intersection for all temporary wmos on this tile
+        if (doodads)
+        {
+            // NOTE: When doodads is false, this implies a line of sight check,
+            // and line of sight checks (for spells, NPC aggro, etc.) should
+            // ignore WMOs if they are spawned dynamically, although I'm not
+            // sure if this ever actually happens in practice.
+            for (auto const& wmo : tile->m_temporaryWmos)
+            {
+                // skip static wmos we have already seen (possibly from a
+                // previous tile)
+                if (temporaryWmos.find(wmo.first) != temporaryWmos.end())
+                    continue;
+
+                // record this temporary wmo as having been tested
+                temporaryWmos.insert(wmo.first);
+
+                // skip this wmo if the bbox doesn't intersect, saves us from
+                // calculating the inverse ray
+                if (!ray.IntersectBoundingBox(wmo.second->m_bounds))
+                    continue;
+
+                math::Ray rayInverse(
+                    math::Vector3::Transform(
+                        start, wmo.second->m_inverseTransformMatrix),
+                    math::Vector3::Transform(
+                        end, wmo.second->m_inverseTransformMatrix));
+
+                // if this is a closer hit, update the original ray's distance
+                if (auto model = wmo.second->m_model.lock())
+                {
+                    if (model->m_aabbTree.IntersectRay(rayInverse) &&
+                        rayInverse.GetDistance() < ray.GetDistance())
+                    {
+                        hit = true;
+                        ray.SetHitPoint(rayInverse.GetDistance());
+                        if (area)
+                            *area =
+                                model
+                                    ->m_nameSetToAreaZone[wmo.second->m_nameSet]
+                                    .first;
+                        if (zone)
+                            *zone =
+                                model
+                                    ->m_nameSetToAreaZone[wmo.second->m_nameSet]
+                                    .second;
+                    }
                 }
             }
         }
 
         // measure intersection for all temporary doodads on this tile
-        for (auto const& doodad : tile->m_temporaryDoodads)
+        if (doodads)
         {
-            // skip static wmos we have already seen (possibly from a previous
-            // tile)
-            if (temporaryDoodads.find(doodad.first) != temporaryDoodads.end())
-                continue;
-
-            // record this temporary wmo as having been tested
-            temporaryDoodads.insert(doodad.first);
-
-            // skip this doodad if the bbox doesn't intersect, saves us from
-            // calculating the inverse ray
-            if (!ray.IntersectBoundingBox(doodad.second->m_bounds))
-                continue;
-
-            math::Ray rayInverse(
-                math::Vector3::Transform(
-                    start, doodad.second->m_inverseTransformMatrix),
-                math::Vector3::Transform(
-                    end, doodad.second->m_inverseTransformMatrix));
-
-            // if this is a closer hit, update the original ray's distance
-            if (doodad.second->m_model.lock()->m_aabbTree.IntersectRay(
-                    rayInverse) &&
-                rayInverse.GetDistance() < ray.GetDistance())
+            for (auto const& doodad : tile->m_temporaryDoodads)
             {
-                hit = true;
-                ray.SetHitPoint(rayInverse.GetDistance());
+                // skip static wmos we have already seen (possibly from a
+                // previous tile)
+                if (temporaryDoodads.find(doodad.first) !=
+                    temporaryDoodads.end())
+                    continue;
+
+                // record this temporary wmo as having been tested
+                temporaryDoodads.insert(doodad.first);
+
+                // skip this doodad if the bbox doesn't intersect, saves us from
+                // calculating the inverse ray
+                if (!ray.IntersectBoundingBox(doodad.second->m_bounds))
+                    continue;
+
+                math::Ray rayInverse(
+                    math::Vector3::Transform(
+                        start, doodad.second->m_inverseTransformMatrix),
+                    math::Vector3::Transform(
+                        end, doodad.second->m_inverseTransformMatrix));
+
+                // if this is a closer hit, update the original ray's distance
+                if (doodad.second->m_model.lock()->m_aabbTree.IntersectRay(
+                        rayInverse) &&
+                    rayInverse.GetDistance() < ray.GetDistance())
+                {
+                    hit = true;
+                    ray.SetHitPoint(rayInverse.GetDistance());
+                }
             }
         }
     }

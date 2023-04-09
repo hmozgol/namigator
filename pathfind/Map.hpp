@@ -51,6 +51,7 @@ private:
     dtNavMeshQuery m_navQuery;
     dtQueryFilter m_queryFilter;
 
+    // TODO: Does this need to be a pointer?
     std::unordered_map<std::pair<int, int>, std::unique_ptr<Tile>> m_tiles;
 
     // indexed by unique instance id.  this data is always loaded.  whenever a
@@ -85,6 +86,8 @@ private:
     std::shared_ptr<DoodadModel>
     EnsureDoodadModelLoaded(const std::string& mpq_path);
 
+    const Tile* GetTile(float x, float y) const;
+
     bool GetADTHeight(const Tile* tile, float x, float y, float& height,
                       unsigned int* zone = nullptr,
                       unsigned int* area = nullptr) const;
@@ -95,11 +98,12 @@ private:
     // DetailSampleMaxError, and users cannot be trusted to honor this
     // restriction.  also, they shouldn't have to, since we want to take care of
     // it for them
-    float FindPreciseZ(float x, float y, float zHint) const;
+    bool FindPreciseZ(const Tile* tile, float x, float y, float zHint,
+                      bool includeAdt, float& result) const;
 
-    bool RayCast(math::Ray& ray) const;
+    bool RayCast(math::Ray& ray, bool doodads) const;
     bool RayCast(math::Ray& ray, const std::vector<const Tile*>& tiles,
-                 unsigned int* zone = nullptr,
+                 bool doodads, unsigned int* zone = nullptr,
                  unsigned int* area = nullptr) const;
 
     // TODO: need mechanism to cleanup expired weak pointers saved in the
@@ -149,6 +153,11 @@ public:
 
     bool ZoneAndArea(const math::Vertex& position, unsigned int& zone,
                      unsigned int& area) const;
+
+    // Returns true when there is line of sight from the start position to
+    // the stop position.  The intended use of this is for spells and NPC
+    // aggro, so doodads and temporary obstacles will be ignored.
+    bool LineOfSight(const math::Vertex& start, const math::Vertex& stop) const;
 
     const dtNavMesh& GetNavMesh() const { return m_navMesh; }
     const dtNavMeshQuery& GetNavMeshQuery() const { return m_navQuery; }
